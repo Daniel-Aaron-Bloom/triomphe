@@ -12,7 +12,7 @@ use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::Deref;
 use core::panic::{RefUnwindSafe, UnwindSafe};
-use core::ptr::{addr_of_mut, self, NonNull};
+use core::ptr::{self, addr_of_mut, NonNull};
 use core::sync::atomic;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 #[cfg(feature = "serde")]
@@ -391,7 +391,10 @@ impl<T: ?Sized> Arc<T> {
                 // mem_to_arcinner keeps the same pointer (caller safety condition)
                 let inner_ptr = mem_to_arcinner(ptr);
                 // Initialize the reference count
-                ptr::write(addr_of_mut!((*inner_ptr).count), atomic::AtomicUsize::new(1));
+                ptr::write(
+                    addr_of_mut!((*inner_ptr).count),
+                    atomic::AtomicUsize::new(1),
+                );
                 // Pointer stays non-null
                 NonNull::new_unchecked(inner_ptr)
             }
@@ -456,8 +459,9 @@ impl<T> Arc<MaybeUninit<T>> {
     }
 
     /// Obtain a mutable pointer to the stored `MaybeUninit<T>`.
+    #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut MaybeUninit<T> {
-        unsafe { &mut (*self.ptr()).data }
+        unsafe { core::ptr::addr_of_mut!((*self.ptr()).data) }
     }
 
     /// # Safety
@@ -1211,6 +1215,26 @@ mod tests {
         });
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn test_as_mut_ptr_sound() {
+        // See https://github.com/Manishearth/triomphe/issues/134
+        //
+        // This tests that obtaining a mutable pointer from a non-unique `Arc` is sound
+        // and does not trigger UB in Miri (e.g. via intermediate `&mut` retagging).
+        //
+        // DANGER: While obtaining the `*mut` pointer is sound, writing to it or
+        // dereferencing it while other shared references (like `shared` below)
+        // are active is still UB. The caller must ensure proper synchronization
+        // and uniqueness before mutating through the pointer.
+        let mut arc1: Arc<MaybeUninit<u64>> = Arc::new_uninit();
+        let arc2 = arc1.clone();
+        let shared: &MaybeUninit<u64> = &*arc2;
+
+        let _ptr: *mut MaybeUninit<u64> = arc1.as_mut_ptr();
+
+        let _copy: MaybeUninit<u64> = *shared;
     }
 
     #[allow(dead_code)]
