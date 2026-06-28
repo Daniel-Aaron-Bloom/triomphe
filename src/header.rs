@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr::{self, addr_of_mut};
 
-use crate::OffsetArc;
+use crate::{AllocError, OffsetArc};
 
 use super::{Arc, ArcInner};
 
@@ -69,6 +69,50 @@ impl<H, T> Arc<HeaderSlice<H, [T]>> {
         }
     }
 
+    /// Fallible version of [`Arc::from_header_and_iter`].
+    ///
+    /// Returns `Err(AllocError)` if allocation fails. As with
+    /// [`Arc::from_header_and_iter`], this **panics** (and leaks the
+    /// uninitialized memory) if the iterator yields a different number of
+    /// elements than it reported, or if the iterator itself panics.
+    pub fn try_from_header_and_iter<I>(header: H, mut items: I) -> Result<Self, AllocError>
+    where
+        I: Iterator<Item = T> + ExactSizeIterator,
+    {
+        let num_items = items.len();
+
+        let inner = Arc::try_allocate_for_header_and_slice(num_items)?;
+
+        unsafe {
+            // Write the data.
+            //
+            // Note that any panics here (i.e. from the iterator) are safe, since
+            // we'll just leak the uninitialized memory.
+            ptr::write(addr_of_mut!((*inner.as_ptr()).data.header), header);
+            let mut current = addr_of_mut!((*inner.as_ptr()).data.slice) as *mut T;
+            for _ in 0..num_items {
+                // ZST writes are a no-op, but we still check iterator length
+                ptr::write(
+                    current,
+                    items
+                        .next()
+                        .expect("ExactSizeIterator over-reported length"),
+                );
+                current = current.add(1);
+            }
+            assert!(
+                items.next().is_none(),
+                "ExactSizeIterator under-reported length"
+            );
+        }
+
+        // Safety: ptr is valid & the inner structure is fully initialized
+        Ok(Arc {
+            p: inner,
+            phantom: PhantomData,
+        })
+    }
+
     /// Creates an Arc for a HeaderSlice using the given header struct and
     /// slice of copyable items. The items will be copied into the resulting
     /// Arc, which will be fat.
@@ -96,6 +140,35 @@ impl<H, T> Arc<HeaderSlice<H, [T]>> {
             p: inner,
             phantom: PhantomData,
         }
+    }
+
+    /// Fallible version of [`Arc::from_header_and_slice`].
+    ///
+    /// Returns `Err(AllocError)` instead of aborting on allocation failure.
+    pub fn try_from_header_and_slice(header: H, items: &[T]) -> Result<Self, AllocError>
+    where
+        T: Copy,
+    {
+        let num_items = items.len();
+
+        let inner = Arc::try_allocate_for_header_and_slice(num_items)?;
+
+        unsafe {
+            // Safety
+            // Header is valid (just allocated)
+            ptr::write(addr_of_mut!((*inner.as_ptr()).data.header), header);
+
+            // dst points to `num_items` of uninitialized T's
+            // T: Copy makes bytewise copying safe
+            let dst: *mut [T] = addr_of_mut!((*inner.as_ptr()).data.slice);
+            ptr::copy_nonoverlapping(items.as_ptr(), dst as *mut T, num_items);
+        }
+
+        // Safety: ptr is valid & the inner structure is fully initialized
+        Ok(Arc {
+            p: inner,
+            phantom: PhantomData,
+        })
     }
 
     /// Creates an Arc for a HeaderSlice using the given header struct and
@@ -137,6 +210,47 @@ impl<H, T> Arc<HeaderSlice<H, [T]>> {
             phantom: PhantomData,
         }
     }
+
+    /// Fallible version of [`Arc::from_header_and_vec`].
+    ///
+    /// Returns `Err(AllocError)` instead of aborting on allocation failure.
+    pub fn try_from_header_and_vec(header: H, mut v: Vec<T>) -> Result<Self, AllocError> {
+        let len = v.len();
+
+        let inner = Arc::try_allocate_for_header_and_slice(len)?;
+
+        unsafe {
+            // Safety: inner is a valid pointer, so this can't go out of bounds
+            let dst = addr_of_mut!((*inner.as_ptr()).data.header);
+
+            // Safety: `dst` is valid for writes (just allocated)
+            ptr::write(dst, header);
+        }
+
+        unsafe {
+            let src = v.as_mut_ptr();
+
+            // Safety: inner is a valid pointer, so this can't go out of bounds
+            let dst = addr_of_mut!((*inner.as_ptr()).data.slice) as *mut T;
+
+            // Safety:
+            // - `src` is valid for reads for `len` (got from `Vec`)
+            // - `dst` is valid for writes for `len` (just allocated, with layout for appropriate slice)
+            // - `src` and `dst` don't overlap (separate allocations)
+            ptr::copy_nonoverlapping(src, dst, len);
+
+            // Deallocate vec without dropping `T`
+            //
+            // Safety: 0..0 elements are always initialized, 0 <= cap for any cap
+            v.set_len(0);
+        }
+
+        // Safety: ptr is valid & the inner structure is fully initialized
+        Ok(Arc {
+            p: inner,
+            phantom: PhantomData,
+        })
+    }
 }
 
 impl<H> Arc<HeaderSlice<H, str>> {
@@ -150,6 +264,19 @@ impl<H> Arc<HeaderSlice<H, str>> {
         //
         //         `bytes` are a valid string since we've just got them from a valid `str`.
         unsafe { Arc::from_raw_inner(Arc::into_raw_inner(bytes) as _) }
+    }
+
+    /// Fallible version of [`Arc::from_header_and_str`].
+    ///
+    /// Returns `Err(AllocError)` instead of aborting on allocation failure.
+    pub fn try_from_header_and_str(header: H, string: &str) -> Result<Self, AllocError> {
+        let bytes = Arc::try_from_header_and_slice(header, string.as_bytes())?;
+
+        // Safety: `ArcInner` and `HeaderSlice` are `repr(C)`, `str` has the same layout as `[u8]`,
+        //         thus it's ok to "transmute" between `Arc<HeaderSlice<H, [u8]>>` and `Arc<HeaderSlice<H, str>>`.
+        //
+        //         `bytes` are a valid string since we've just got them from a valid `str`.
+        Ok(unsafe { Arc::from_raw_inner(Arc::into_raw_inner(bytes) as _) })
     }
 }
 
@@ -340,11 +467,57 @@ mod tests {
     }
 
     #[test]
+    fn try_from_header_and_iter_smoke() {
+        let arc = Arc::try_from_header_and_iter(
+            (42u32, 17u8),
+            IntoIterator::into_iter([1u16, 2, 3, 4, 5, 6, 7]),
+        )
+        .unwrap();
+
+        assert_eq!(arc.header, (42, 17));
+        assert_eq!(arc.slice, [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
     fn from_header_and_slice_smoke() {
         let arc = Arc::from_header_and_slice((42u32, 17u8), &[1u16, 2, 3, 4, 5, 6, 7]);
 
         assert_eq!(arc.header, (42, 17));
         assert_eq!(arc.slice, [1u16, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn try_from_header_and_slice_smoke() {
+        let arc = Arc::try_from_header_and_slice((42u32, 17u8), &[1u16, 2, 3, 4, 5, 6, 7]).unwrap();
+
+        assert_eq!(arc.header, (42, 17));
+        assert_eq!(arc.slice, [1u16, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn try_from_header_and_vec_smoke() {
+        let arc =
+            Arc::try_from_header_and_vec((42u32, 17u8), vec![1u16, 2, 3, 4, 5, 6, 7]).unwrap();
+
+        assert_eq!(arc.header, (42, 17));
+        assert_eq!(arc.slice, [1u16, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn try_from_header_and_str_smoke() {
+        let a = Arc::try_from_header_and_str(
+            42,
+            "The answer to the ultimate question of life, the universe, and everything",
+        )
+        .unwrap();
+        assert_eq!(a.header, 42);
+        assert_eq!(
+            &a.slice,
+            "The answer to the ultimate question of life, the universe, and everything"
+        );
+
+        let empty = Arc::try_from_header_and_str((), "").unwrap();
+        assert_eq!(&empty.slice, "");
     }
 
     #[test]
