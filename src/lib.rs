@@ -35,6 +35,7 @@ extern crate stable_deref_trait;
 #[cfg(feature = "unsize")]
 extern crate unsize;
 
+mod alloc_error;
 mod arc;
 mod arc_borrow;
 #[cfg(feature = "arc-swap")]
@@ -46,6 +47,7 @@ mod offset_arc;
 mod thin_arc;
 mod unique_arc;
 
+pub use alloc_error::*;
 pub use arc::*;
 pub use arc_borrow::*;
 pub use arc_union::*;
