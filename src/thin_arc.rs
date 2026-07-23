@@ -336,10 +336,9 @@ impl<H, T> Arc<HeaderSliceWithLengthProtected<H, T>> {
     /// Converts an `Arc` into a `ThinArc`. This consumes the `Arc`, so the refcount
     /// is not modified.
     #[inline]
-    pub fn protected_into_thin(a: Self) -> ThinArc<H, T> {
-        debug_assert_eq!(
-            a.length(),
-            a.slice().len(),
+    pub const fn protected_into_thin(a: Self) -> ThinArc<H, T> {
+        debug_assert!(
+            a.inner().data.length() == a.inner().data.slice().len(),
             "Length needs to be correct for ThinArc to work"
         );
 

@@ -231,7 +231,7 @@ impl<T> Arc<[T]> {
     ///  # Safety
     /// - The given pointer must be a valid pointer to `[T]` that came from [`Arc::into_raw`].
     /// - After `from_raw_slice`, the pointer must not be accessed.
-    pub unsafe fn from_raw_slice(ptr: *const [T]) -> Self {
+    pub const unsafe fn from_raw_slice(ptr: *const [T]) -> Self {
         Arc::from_raw(ptr)
     }
 }
@@ -278,16 +278,16 @@ impl<T: ?Sized> Arc<T> {
     /// Converts a `OffsetArc` into an `Arc`. This consumes the `OffsetArc`, so the refcount
     /// is not modified.
     #[inline]
-    pub fn from_raw_offset(a: OffsetArc<T>) -> Self {
-        let a = ManuallyDrop::new(a);
+    pub const fn from_raw_offset(a: OffsetArc<T>) -> Self {
         let ptr = a.ptr.as_ptr();
+        mem::forget(a);
         unsafe { Arc::from_raw(ptr) }
     }
 
     /// Converts an `Arc` into a `OffsetArc`. This consumes the `Arc`, so the refcount
     /// is not modified.
     #[inline]
-    pub fn into_raw_offset(a: Self) -> OffsetArc<T> {
+    pub const fn into_raw_offset(a: Self) -> OffsetArc<T> {
         unsafe {
             OffsetArc {
                 ptr: ptr::NonNull::new_unchecked(Arc::into_raw(a) as *mut T),
