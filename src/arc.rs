@@ -1,7 +1,6 @@
 use alloc::alloc::handle_alloc_error;
 use alloc::boxed::Box;
 use core::alloc::Layout;
-use core::borrow;
 use core::cmp::Ordering;
 use core::convert::From;
 use core::ffi::c_void;
@@ -15,6 +14,7 @@ use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::ptr::{self, addr_of_mut, NonNull};
 use core::sync::atomic;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use core::{borrow, mem};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "stable_deref_trait")]
@@ -48,12 +48,14 @@ impl<T: ?Sized> ArcInner<T> {
     ///   That happens automatically if the pointer comes from `Arc` and type was not changed.
     ///   This is **not** the case, for example, when `Arc` was uninitialized `MaybeUninit<T>`
     ///   and the pointer was cast to `*const T`.
-    unsafe fn offset_of_data(value: *const T) -> usize {
+    const unsafe fn offset_of_data(value: *const T) -> usize {
         // We can use `Layout::for_value_raw` when it is stable.
         let value = &*value;
 
         let layout = Layout::new::<atomic::AtomicUsize>();
-        let (_, offset) = layout.extend(Layout::for_value(value)).unwrap();
+        let Ok((_, offset)) = layout.extend(Layout::for_value(value)) else {
+            panic!("failed to extend")
+        };
         offset
     }
 }
@@ -241,9 +243,10 @@ impl<T: ?Sized> Arc<T> {
     ///
     /// It is recommended to use OffsetArc for this.
     #[inline]
-    pub fn into_raw(this: Self) -> *const T {
-        let this = ManuallyDrop::new(this);
-        this.as_ptr()
+    pub const fn into_raw(this: Self) -> *const T {
+        let ret = this.as_ptr();
+        mem::forget(this);
+        ret
     }
 
     /// Reconstruct the `Arc<T>` from a raw pointer obtained from into_raw()
@@ -257,7 +260,7 @@ impl<T: ?Sized> Arc<T> {
     /// - The given pointer must be a valid pointer to `T` that came from [`Arc::into_raw`].
     /// - After `from_raw`, the pointer must not be accessed.
     #[inline]
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
+    pub const unsafe fn from_raw(ptr: *const T) -> Self {
         // To find the corresponding pointer to the `ArcInner` we need
         // to subtract the offset of the `data` field from the pointer.
 
@@ -297,7 +300,7 @@ impl<T: ?Sized> Arc<T> {
     ///
     /// Same as into_raw except `self` isn't consumed.
     #[inline]
-    pub fn as_ptr(&self) -> *const T {
+    pub const fn as_ptr(&self) -> *const T {
         // SAFETY: This cannot go through a reference to `data`, because this method
         // is used to implement `into_raw`. To reconstruct the full `Arc` from this
         // pointer, it needs to maintain its full provenance, and not be reduced to
@@ -310,13 +313,13 @@ impl<T: ?Sized> Arc<T> {
     /// It has the benefits of an `&T` but also knows about the underlying refcount
     /// and can be converted into more `Arc<T>`s if necessary.
     #[inline]
-    pub fn borrow_arc(&self) -> ArcBorrow<'_, T> {
+    pub const fn borrow_arc(&self) -> ArcBorrow<'_, T> {
         unsafe { ArcBorrow(NonNull::new_unchecked(self.as_ptr() as *mut T), PhantomData) }
     }
 
     /// Returns the address on the heap of the Arc itself -- not the T within it -- for memory
     /// reporting.
-    pub fn heap_ptr(&self) -> *const c_void {
+    pub const fn heap_ptr(&self) -> *const c_void {
         self.p.as_ptr() as *const ArcInner<T> as *const c_void
     }
 
@@ -334,16 +337,17 @@ impl<T: ?Sized> Arc<T> {
     }
 
     #[inline]
-    pub(super) fn into_raw_inner(this: Self) -> *mut ArcInner<T> {
-        let this = ManuallyDrop::new(this);
-        this.ptr()
+    pub(super) const fn into_raw_inner(this: Self) -> *mut ArcInner<T> {
+        let ret = this.ptr();
+        mem::forget(this);
+        ret
     }
 
     /// Construct an `Arc` from an allocated `ArcInner`.
     /// # Safety
     /// The `ptr` must point to a valid instance, allocated by an `Arc`. The reference could will
     /// not be modified.
-    pub(super) unsafe fn from_raw_inner(ptr: *mut ArcInner<T>) -> Self {
+    pub(super) const unsafe fn from_raw_inner(ptr: *mut ArcInner<T>) -> Self {
         Arc {
             p: ptr::NonNull::new_unchecked(ptr),
             phantom: PhantomData,
@@ -351,7 +355,7 @@ impl<T: ?Sized> Arc<T> {
     }
 
     #[inline]
-    pub(super) fn inner(&self) -> &ArcInner<T> {
+    pub(super) const fn inner(&self) -> &ArcInner<T> {
         // This unsafety is ok because while this arc is alive we're guaranteed
         // that the inner pointer is valid. Furthermore, we know that the
         // `ArcInner` structure itself is `Sync` because the inner data is
@@ -373,7 +377,7 @@ impl<T: ?Sized> Arc<T> {
         ptr::addr_eq(this.ptr(), other.ptr())
     }
 
-    pub(crate) fn ptr(&self) -> *mut ArcInner<T> {
+    pub(crate) const fn ptr(&self) -> *mut ArcInner<T> {
         self.p.as_ptr()
     }
 
@@ -562,7 +566,7 @@ impl<T> Arc<MaybeUninit<T>> {
 
     /// Obtain a mutable pointer to the stored `MaybeUninit<T>`.
     #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut MaybeUninit<T> {
+    pub const fn as_mut_ptr(&mut self) -> *mut MaybeUninit<T> {
         unsafe { core::ptr::addr_of_mut!((*self.ptr()).data) }
     }
 
@@ -570,8 +574,10 @@ impl<T> Arc<MaybeUninit<T>> {
     ///
     /// Must initialize all fields before calling this function.
     #[inline]
-    pub unsafe fn assume_init(self) -> Arc<T> {
-        Arc::from_raw_inner(ManuallyDrop::new(self).ptr().cast())
+    pub const unsafe fn assume_init(self) -> Arc<T> {
+        let ptr = self.ptr();
+        mem::forget(self);
+        Arc::from_raw_inner(ptr.cast())
     }
 }
 
@@ -602,8 +608,10 @@ impl<T> Arc<[MaybeUninit<T>]> {
     ///
     /// Must initialize all fields before calling this function.
     #[inline]
-    pub unsafe fn assume_init(self) -> Arc<[T]> {
-        Arc::from_raw_inner(ManuallyDrop::new(self).ptr() as _)
+    pub const unsafe fn assume_init(self) -> Arc<[T]> {
+        let ptr = self.ptr();
+        mem::forget(self);
+        Arc::from_raw_inner(ptr as _)
     }
 }
 

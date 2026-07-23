@@ -1,6 +1,5 @@
 use core::cmp::Ordering;
 use core::ffi::c_void;
-use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::{ExactSizeIterator, Iterator};
 use core::marker::PhantomData;
@@ -8,6 +7,7 @@ use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::ptr;
+use core::{fmt, mem};
 
 use super::{Arc, ArcInner, HeaderSlice, HeaderSliceWithLengthProtected, HeaderWithLength};
 use crate::header::HeaderSliceWithLengthUnchecked;
@@ -55,7 +55,9 @@ impl<H: RefUnwindSafe, T: RefUnwindSafe> UnwindSafe for ThinArc<H, T> {}
 //
 // See the comment around the analogous operation in from_header_and_iter.
 #[inline]
-fn thin_to_thick<H, T>(arc: &ThinArc<H, T>) -> *mut ArcInner<HeaderSliceWithLengthProtected<H, T>> {
+const fn thin_to_thick<H, T>(
+    arc: &ThinArc<H, T>,
+) -> *mut ArcInner<HeaderSliceWithLengthProtected<H, T>> {
     let thin = arc.ptr.as_ptr();
     let len = unsafe { (*thin).data.header.length };
     let fake_slice = ptr::slice_from_raw_parts_mut(thin as *mut T, len);
@@ -198,14 +200,14 @@ impl<H, T> ThinArc<H, T> {
     /// Returns the address on the heap of the ThinArc itself -- not the T
     /// within it -- for memory reporting.
     #[inline]
-    pub fn ptr(&self) -> *const c_void {
+    pub const fn ptr(&self) -> *const c_void {
         self.ptr.cast().as_ptr()
     }
 
     /// Returns the address on the heap of the Arc itself -- not the T within it -- for memory
     /// reporting.
     #[inline]
-    pub fn heap_ptr(&self) -> *const c_void {
+    pub const fn heap_ptr(&self) -> *const c_void {
         self.ptr()
     }
 
@@ -221,7 +223,7 @@ impl<H, T> ThinArc<H, T> {
     /// This function is unsafe because improper use may lead to memory unsafety,
     /// even if the returned ThinArc is never accessed.
     #[inline]
-    pub unsafe fn from_raw(ptr: *const c_void) -> Self {
+    pub const unsafe fn from_raw(ptr: *const c_void) -> Self {
         Self {
             ptr: ptr::NonNull::new_unchecked(ptr as *mut c_void).cast(),
             phantom: PhantomData,
@@ -230,16 +232,17 @@ impl<H, T> ThinArc<H, T> {
 
     /// Consume ThinArc and returned the wrapped pointer.
     #[inline]
-    pub fn into_raw(self) -> *const c_void {
-        let this = ManuallyDrop::new(self);
-        this.ptr()
+    pub const fn into_raw(self) -> *const c_void {
+        let ret = self.ptr();
+        mem::forget(self);
+        ret
     }
 
     /// Provides a raw pointer to the data.
     /// The counts are not affected in any way and the ThinArc is not consumed.
     /// The pointer is valid for as long as there are strong counts in the ThinArc.
     #[inline]
-    pub fn as_ptr(&self) -> *const c_void {
+    pub const fn as_ptr(&self) -> *const c_void {
         self.ptr()
     }
 
@@ -314,14 +317,14 @@ impl<H, T> Arc<HeaderSliceWithLengthUnchecked<H, T>> {
     /// Converts a `ThinArc` into an `Arc`. This consumes the `ThinArc`, so the refcount
     /// is not modified.
     #[inline]
-    pub fn from_thin(a: ThinArc<H, T>) -> Self {
+    pub const fn from_thin(a: ThinArc<H, T>) -> Self {
         Self::from_protected(Arc::<HeaderSliceWithLengthProtected<H, T>>::protected_from_thin(a))
     }
 
     /// Converts an `Arc` into a `ThinArc`. This consumes the `Arc`, so the refcount
     /// is not modified.
     #[inline]
-    fn from_protected(a: Arc<HeaderSliceWithLengthProtected<H, T>>) -> Self {
+    const fn from_protected(a: Arc<HeaderSliceWithLengthProtected<H, T>>) -> Self {
         // Safety: HeaderSliceWithLengthProtected and HeaderSliceWithLengthUnchecked have the same layout
         // The whole `Arc` should also be layout compatible (as a transparent wrapper around `NonNull` pointers with the same
         // metadata type) but we still conservatively avoid a direct transmute here and use a pointer-cast instead.
@@ -352,9 +355,9 @@ impl<H, T> Arc<HeaderSliceWithLengthProtected<H, T>> {
     /// Converts a `ThinArc` into an `Arc`. This consumes the `ThinArc`, so the refcount
     /// is not modified.
     #[inline]
-    pub fn protected_from_thin(a: ThinArc<H, T>) -> Self {
-        let a = ManuallyDrop::new(a);
+    pub const fn protected_from_thin(a: ThinArc<H, T>) -> Self {
         let ptr = thin_to_thick(&a);
+        mem::forget(a);
         unsafe { Arc::from_raw_inner(ptr) }
     }
 
@@ -363,7 +366,9 @@ impl<H, T> Arc<HeaderSliceWithLengthProtected<H, T>> {
     /// # Safety
     /// Assumes that the header length matches the slice length.
     #[inline]
-    unsafe fn from_unprotected_unchecked(a: Arc<HeaderSliceWithLengthUnchecked<H, T>>) -> Self {
+    const unsafe fn from_unprotected_unchecked(
+        a: Arc<HeaderSliceWithLengthUnchecked<H, T>>,
+    ) -> Self {
         // Safety: HeaderSliceWithLengthProtected and HeaderSliceWithLengthUnchecked have the same layout
         // and the safety invariant on HeaderSliceWithLengthProtected.inner is bubbled up
         // The whole `Arc` should also be layout compatible (as a transparent wrapper around `NonNull` pointers with the same

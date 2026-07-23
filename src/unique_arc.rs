@@ -3,7 +3,7 @@ use alloc::{alloc::Layout, boxed::Box};
 use core::convert::TryFrom;
 use core::iter::FromIterator;
 use core::marker::PhantomData;
-use core::mem::{ManuallyDrop, MaybeUninit};
+use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, addr_of_mut};
 
@@ -118,8 +118,13 @@ impl<T> UniqueArc<T> {
 impl<T: ?Sized> UniqueArc<T> {
     /// Convert to a shareable `Arc<T>` once we're done mutating it
     #[inline]
-    pub fn shareable(self) -> Arc<T> {
-        self.0
+    pub const fn shareable(self) -> Arc<T> {
+        let p = self.0.p;
+        mem::forget(self);
+        Arc {
+            p,
+            phantom: PhantomData,
+        }
     }
 
     /// Creates a new [`UniqueArc`] from the given [`Arc`].
@@ -167,7 +172,7 @@ impl<T> UniqueArc<MaybeUninit<T>> {
     }
 
     /// Obtain a mutable pointer to the stored `MaybeUninit<T>`.
-    pub fn as_mut_ptr(&mut self) -> *mut MaybeUninit<T> {
+    pub const fn as_mut_ptr(&mut self) -> *mut MaybeUninit<T> {
         unsafe { &mut (*self.0.ptr()).data }
     }
 
@@ -179,9 +184,11 @@ impl<T> UniqueArc<MaybeUninit<T>> {
     /// same safety requirements. You are responsible for ensuring that the `T`
     /// has actually been initialized before calling this method.
     #[inline]
-    pub unsafe fn assume_init(this: Self) -> UniqueArc<T> {
+    pub const unsafe fn assume_init(this: Self) -> UniqueArc<T> {
+        let p = this.0.p.cast();
+        mem::forget(this);
         UniqueArc(Arc {
-            p: ManuallyDrop::new(this).0.p.cast(),
+            p,
             phantom: PhantomData,
         })
     }
@@ -214,8 +221,10 @@ impl<T> UniqueArc<[MaybeUninit<T>]> {
     ///
     /// Must initialize all fields before calling this function.
     #[inline]
-    pub unsafe fn assume_init_slice(Self(this): Self) -> UniqueArc<[T]> {
-        UniqueArc(this.assume_init())
+    pub const unsafe fn assume_init_slice(this: Self) -> UniqueArc<[T]> {
+        let ptr = this.0.ptr();
+        mem::forget(this);
+        unsafe { UniqueArc(Arc::from_raw_inner(ptr as _)) }
     }
 }
 
@@ -270,7 +279,7 @@ impl<H, T> UniqueArc<HeaderSlice<H, [MaybeUninit<T>]>> {
     ///
     /// Must initialize all fields before calling this function.
     #[inline]
-    pub unsafe fn assume_init_slice_with_header(self) -> UniqueArc<HeaderSlice<H, [T]>> {
+    pub const unsafe fn assume_init_slice_with_header(self) -> UniqueArc<HeaderSlice<H, [T]>> {
         unsafe { core::mem::transmute(self) }
     }
 }
